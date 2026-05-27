@@ -246,35 +246,4 @@ USB 5V → regulator → 3.3V
 Wszystkie moduły pracują na 3.3V  
 (TFT, OLED, PN532, touch sensor)
 
-ESP32
-│
-├── TFT ST7735 (SPI)
-│   ├── CS  → GPIO 5
-│   ├── DC  → GPIO 17
-│   ├── RST → GPIO 16
-│   ├── MOSI → GPIO 23
-│   ├── SCK  → GPIO 18
-│   ├── VCC → 3.3V
-│   └── GND → GND
-│
-├── OLED SSD1306 (I2C)
-│   ├── SDA → GPIO 21
-│   ├── SCL → GPIO 22
-│   ├── VCC → 3.3V
-│   └── GND → GND
-│
-├── PN532 (Soft I2C)
-│   ├── SDA → GPIO 32
-│   ├── SCL → GPIO 33
-│   ├── VCC → 3.3V
-│   └── GND → GND
-│
-├── Potencjometr
-│   ├── OUT → GPIO 34
-│   ├── VCC → 3.3V
-│   └── GND → GND
-│
-└── Przycisk dotykowy
-    ├── OUT → GPIO 13
-    ├── VCC → 3.3V
-    └── GND → GND
+
