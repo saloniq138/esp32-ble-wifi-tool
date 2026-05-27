@@ -32,7 +32,7 @@ const int POT_PIN   = 34;
 const int TOUCH_PIN = 13;
 
 // --- MENU GŁÓWNE ---
-const int ILOSC_OPCJI = 7;
+const int ILOSC_OPCJI = 8;
 const char* menuItems[ILOSC_OPCJI] = {
   "1. Skaner Wi-Fi",
   "2. GENERUJ 20+ SIECI",
@@ -40,7 +40,8 @@ const char* menuItems[ILOSC_OPCJI] = {
   "4. Klonuj / Emuluj NFC",
   "5. Bruce: Skaner BLE",
   "6. Bruce: Wardriving",
-  "7. BLE Traffic Monitor"
+  "7. Tracker / Radar BLE",
+  "8. BLE Traffic Monitor"
 };
 
 int  wybranaOpcja  = 0;
@@ -52,6 +53,23 @@ bool nfcDostepne   = false;
 float obecnaPozycjaY   = 35.0;
 float docelowaPozycjaY = 35.0;
 
+// --- BAZA OUI VENDOR LOOKUP ---
+struct VendorOUI {
+  uint8_t oui[3];
+  const char* nazwa;
+};
+
+const int ILOSC_PRODUCENTOW = 7;
+VendorOUI bazaOUI[ILOSC_PRODUCENTOW] = {
+  {{0xAC, 0x37, 0x43}, "Apple"},
+  {{0x00, 0x17, 0x88}, "Philips"},
+  {{0x24, 0x4B, 0x03}, "Espressif"},
+  {{0xBC, 0xD0, 0x74}, "Samsung"},
+  {{0xD8, 0xEC, 0x5E}, "Xiaomi"},
+  {{0xE0, 0xD5, 0x5E}, "Huawei"},
+  {{0x00, 0x04, 0x48}, "Intel"}
+};
+
 // --- BLE ---
 volatile int bleDevicesCount = 0;
 int pakietyStandardowe = 0;
@@ -59,10 +77,18 @@ int pakietyIBeacon     = 0;
 
 struct BleDevice {
   char mac[18];
+  uint8_t rawMac[6];
   int  rssi;
   char name[15];
+  const char* vendor;
 };
 BleDevice znalezioneUrzadzenia[3];
+
+// --- ZMIENNE TRACKERA ---
+char sledzonyMacStr[18] = "";
+uint8_t sledzonyMacRaw[6] = {0};
+int sledzoneRSSI = -100;
+bool znalezionoTargetWSesji = false;
 
 // --- SIECI FAŁSZYWE ---
 const int  ILOSC_SIECI = 20;
@@ -85,11 +111,40 @@ const unsigned long INTERWAL_ROTACJI = 25;
 String             namierzanaSiec = "";
 
 // -------------------------------------------------------
+// FUNKCJA SZUKAJĄCA PRODUCENTA PO MAC
+// -------------------------------------------------------
+const char* znajdzProducenta(uint8_t* mac) {
+  for (int i = 0; i < ILOSC_PRODUCENTOW; i++) {
+    if (mac[0] == bazaOUI[i].oui[0] && 
+        mac[1] == bazaOUI[i].oui[1] && 
+        mac[2] == bazaOUI[i].oui[2]) {
+      return bazaOUI[i].nazwa;
+    }
+  }
+  return "Inny";
+}
+
+// -------------------------------------------------------
 // CALLBACK BLE
 // -------------------------------------------------------
 void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
   if (event != ESP_GAP_BLE_SCAN_RESULT_EVT) return;
   if (param->scan_rst.search_evt != ESP_GAP_SEARCH_INQ_RES_EVT) return;
+
+  // Sprawdzanie czy szukamy konkretnego targetu dla Trackera
+  if (strlen(sledzonyMacStr) > 0) {
+    bool zgodny = true;
+    for(int i=0; i<6; i++) {
+      if(param->scan_rst.bda[i] != sledzonyMacRaw[i]) {
+        zgodny = false;
+        break;
+      }
+    }
+    if (zgodny) {
+      sledzoneRSSI = param->scan_rst.rssi;
+      znalezionoTargetWSesji = true;
+    }
+  }
 
   uint8_t *adv_data     = param->scan_rst.ble_adv;
   uint8_t  adv_data_len = param->scan_rst.adv_data_len;
@@ -106,12 +161,16 @@ void ble_gap_cb(esp_gap_ble_cb_event_t event, esp_ble_gap_cb_param_t *param) {
   else                  pakietyStandardowe++;
 
   if (bleDevicesCount < 3) {
+    memcpy(znalezioneUrzadzenia[bleDevicesCount].rawMac, param->scan_rst.bda, 6);
+    
     snprintf(znalezioneUrzadzenia[bleDevicesCount].mac, 18,
              "%02X:%02X:%02X:%02X:%02X:%02X",
              param->scan_rst.bda[0], param->scan_rst.bda[1],
              param->scan_rst.bda[2], param->scan_rst.bda[3],
              param->scan_rst.bda[4], param->scan_rst.bda[5]);
+             
     znalezioneUrzadzenia[bleDevicesCount].rssi = param->scan_rst.rssi;
+    znalezioneUrzadzenia[bleDevicesCount].vendor = znajdzProducenta(param->scan_rst.bda);
 
     uint8_t  len_tmp  = 0;
     uint8_t *name_ptr = esp_ble_resolve_adv_data(param->scan_rst.ble_adv,
@@ -168,10 +227,7 @@ void setup() {
   Serial.begin(115200);
   pinMode(TOUCH_PIN, INPUT);
 
-  // ZABEZPIECZENIE: Zmuszamy Wi-Fi do pracy w RAM, aby szybka rotacja nie zniszczyła pamięci Flash
   esp_wifi_set_storage(WIFI_STORAGE_RAM);
-
-  // NVS wymagane przez BT
   nvs_flash_init();
 
   WiFi.mode(WIFI_STA);
@@ -249,7 +305,6 @@ void obslugaSzybkiejRotacji() {
   aktualnyIndeksNazwy = (aktualnyIndeksNazwy + 1) % ILOSC_SIECI;
   superszybkaZmienNazwe(zabawneSieci[aktualnyIndeksNazwy]);
 
-  // Odśwież ekran tylko przy pełnym obrocie
   if (aktualnyIndeksNazwy == 0) {
     tft.fillScreen(ST77XX_BLACK);
     tft.drawRect(0, 0, 160, 80, ST77XX_BLUE);
@@ -287,7 +342,6 @@ void uruchomRadar() {
   int wybranyCel = 0;
   int staryCel   = -1;
 
-  // Wybór celu pokrętłem
   czekajNaPuszczenieCaly();
   while (digitalRead(TOUCH_PIN) == LOW) {
     int pot = analogRead(POT_PIN);
@@ -312,7 +366,6 @@ void uruchomRadar() {
   namierzanaSiec = WiFi.SSID(wybranyCel);
   czekajNaPuszczenieCaly();
 
-  // Śledzenie sygnału
   while (digitalRead(TOUCH_PIN) == LOW) {
     int liczbaSieci = WiFi.scanNetworks(false, false);
     int aktualneRSSI = -100;
@@ -475,7 +528,7 @@ void deinit_lightweight_ble() {
 }
 
 // -------------------------------------------------------
-// OPCJA 5: BRUCE BLE SCANNER
+// OPCJA 5: BRUCE BLE SCANNER (Z VENDOR LOOKUP)
 // -------------------------------------------------------
 void uruchomBruceBLEScanner() {
   tft.fillScreen(ST77XX_BLACK);
@@ -505,13 +558,18 @@ void uruchomBruceBLEScanner() {
     tft.drawRect(0, 0, 160, 80, ST77XX_MAGENTA);
     tft.setTextColor(ST77XX_MAGENTA);
     tft.setCursor(10, 12);
-    tft.printf("Aktywne cele BLE: %d", bleDevicesCount);
+    tft.printf("Urzadzenia BLE: %d", bleDevicesCount);
 
-    for (int i = 0; i < bleDevicesCount; i++) {
-      tft.setCursor(5, 26 + i * 18);
+    for (int i = 0; i < min((int)bleDevicesCount, 2); i++) {
+      tft.setCursor(5, 26 + i * 24);
       tft.setTextColor(ST77XX_YELLOW);
       tft.printf("%s (%d)", znalezioneUrzadzenia[i].name, znalezioneUrzadzenia[i].rssi);
-      tft.setCursor(5, 34 + i * 18);
+      
+      tft.setCursor(5, 36 + i * 24);
+      tft.setTextColor(ST77XX_CYAN);
+      tft.printf("Mfr: %s", znalezioneUrzadzenia[i].vendor);
+
+      tft.setCursor(5, 46 + i * 24);
       tft.setTextColor(ST77XX_DARKGREY);
       tft.print(znalezioneUrzadzenia[i].mac);
     }
@@ -523,7 +581,7 @@ void uruchomBruceBLEScanner() {
 }
 
 // -------------------------------------------------------
-// OPCJA 6: BRUCE WARDRIVING (ZAKTUALIZOWANA)
+// OPCJA 6: BRUCE WARDRIVING
 // -------------------------------------------------------
 void uruchomBruceWardriving() {
   tft.fillScreen(ST77XX_BLACK);
@@ -535,7 +593,6 @@ void uruchomBruceWardriving() {
   tft.setCursor(10, 35);
   tft.print("Przeczesywanie pasma...");
 
-  // Pasywne skanowanie z uwzględnieniem sieci ukrytych
   int n = WiFi.scanNetworks(false, true);
   
   tft.fillScreen(ST77XX_BLACK);
@@ -548,11 +605,8 @@ void uruchomBruceWardriving() {
     int wyswietl = min(n, 3);
     for (int i = 0; i < wyswietl; i++) {
       String ssid = WiFi.SSID(i);
-      if (ssid.length() == 0) {
-        ssid = "[Ukryta]";
-      } else if (ssid.length() > 10) {
-        ssid = ssid.substring(0, 8) + "..";
-      }
+      if (ssid.length() == 0) ssid = "[Ukryta]";
+      else if (ssid.length() > 10) ssid = ssid.substring(0, 8) + "..";
 
       String sec = konwertujZabezpieczenie(WiFi.encryptionType(i));
 
@@ -563,25 +617,135 @@ void uruchomBruceWardriving() {
       tft.setTextColor(ST77XX_YELLOW);
       tft.printf("RSSI:%d %s", WiFi.RSSI(i), sec.c_str());
     }
-  } else if (n == 0) {
-    tft.setCursor(5, 35);
-    tft.setTextColor(ST77XX_WHITE);
-    tft.print("Brak sieci w zasiegu.");
   }
 
   tft.setCursor(5, 72);
   tft.setTextColor(ST77XX_DARKGREY);
   tft.print("Dotknij, aby wyjsc");
 
-  // Bezpieczne zwolnienie pamięci podręcznej struktur skanowania WiFi
   WiFi.scanDelete();
-
   czekajNaWcisniecie();
   powrotDoMenu();
 }
 
 // -------------------------------------------------------
-// OPCJA 7: PASYWNY MONITOR RUCHU BLE
+// OPCJA 7: NOWA FUNKCJA - TRACKER / RADAR BLE
+// -------------------------------------------------------
+void uruchomTrackerBLE() {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setCursor(10, 35);
+  tft.setTextColor(ST77XX_CYAN);
+  tft.print("Skanowanie celow BLE...");
+
+  init_lightweight_ble();
+  
+  esp_ble_scan_params_t scan_params = {
+    .scan_type          = BLE_SCAN_TYPE_ACTIVE,
+    .own_addr_type      = BLE_ADDR_TYPE_PUBLIC,
+    .scan_filter_policy = BLE_SCAN_FILTER_ALLOW_ALL,
+    .scan_interval      = 0x50,
+    .scan_window        = 0x30
+  };
+  esp_ble_gap_set_scan_params(&scan_params);
+  
+  bleDevicesCount = 0;
+  esp_ble_gap_start_scanning(2);
+  delay(2200);
+
+  if (bleDevicesCount == 0) {
+    tft.fillScreen(ST77XX_BLACK);
+    tft.setCursor(10, 35);
+    tft.print("Brak urzadzen BLE!");
+    delay(2000);
+    deinit_lightweight_ble();
+    powrotDoMenu();
+    return;
+  }
+
+  int indeksCelu = 0;
+  int staryIndeks = -1;
+  czekajNaPuszczenieCaly();
+
+  // Wybór urządzenia za pomocą potencjometru
+  while (digitalRead(TOUCH_PIN) == LOW) {
+    int pot = analogRead(POT_PIN);
+    indeksCelu = map(pot, 0, 4095, 0, min((int)(bleDevicesCount - 1), 2));
+
+    if (indeksCelu != staryIndeks) {
+      tft.fillScreen(ST77XX_BLACK);
+      tft.drawRect(0, 0, 160, 80, ST77XX_CYAN);
+      tft.setCursor(10, 15);
+      tft.setTextColor(ST77XX_YELLOW);
+      tft.print("Wybierz urz. BLE:");
+      tft.setCursor(10, 38);
+      tft.setTextColor(ST77XX_WHITE);
+      tft.print(znalezioneUrzadzenia[indeksCelu].name);
+      tft.setCursor(10, 55);
+      tft.setTextColor(ST77XX_GREEN);
+      tft.printf("Mfr: %s", znalezioneUrzadzenia[indeksCelu].vendor);
+      staryIndeks = indeksCelu;
+    }
+    delay(50);
+  }
+
+  // Zapisanie wybranego celu do śledzenia sesyjnego
+  strncpy(sledzonyMacStr, znalezioneUrzadzenia[indeksCelu].mac, 18);
+  memcpy(sledzonyMacRaw, znalezioneUrzadzenia[indeksCelu].rawMac, 6);
+  String sledzonaNazwa = znalezioneUrzadzenia[indeksCelu].name;
+  
+  czekajNaPuszczenieCaly();
+
+  // Główna pętla polowania / Trackera
+  while (digitalRead(TOUCH_PIN) == LOW) {
+    znalezionoTargetWSesji = false;
+    esp_ble_gap_start_scanning(1);
+    delay(1050); // Okno nasłuchu pasywnego
+
+    tft.fillScreen(ST77XX_BLACK);
+    
+    if (znalezionoTargetWSesji) {
+      int pasekSygnalu = map(constrain(sledzoneRSSI, -95, -25), -95, -25, 0, 140);
+      uint16_t kolorPaska = ST77XX_RED;
+      if (sledzoneRSSI > -70) kolorPaska = ST77XX_YELLOW;
+      if (sledzoneRSSI > -50) kolorPaska = ST77XX_GREEN;
+
+      tft.drawRect(0, 0, 160, 80, kolorPaska);
+      tft.setCursor(10, 15);
+      tft.setTextColor(ST77XX_WHITE);
+      tft.printf("TRACKING: %s", sledzonaNazwa.c_str());
+
+      tft.drawRect(10, 28, 140, 15, ST77XX_WHITE);
+      if (pasekSygnalu > 0) {
+        tft.fillRect(10, 28, pasekSygnalu, 15, kolorPaska);
+      }
+
+      tft.setCursor(10, 58);
+      tft.setTextColor(kolorPaska);
+      tft.printf("Sygnal: %d dBm", sledzoneRSSI);
+    } else {
+      tft.drawRect(0, 0, 160, 80, ST77XX_RED);
+      tft.setCursor(10, 25);
+      tft.setTextColor(ST77XX_RED);
+      tft.print("TARGET ZAGUBIONY");
+      tft.setCursor(10, 50);
+      tft.setTextColor(ST77XX_DARKGREY);
+      tft.print("Szukanie emisji...");
+    }
+
+    tft.setCursor(10, 71);
+    tft.setTextColor(ST77XX_DARKGREY);
+    tft.print("Dotknij, aby wyjsc");
+  }
+
+  // Reset flag trackingowych
+  memset(sledzonyMacStr, 0, sizeof(sledzonyMacStr));
+  deinit_lightweight_ble();
+  czekajNaPuszczenieCaly();
+  powrotDoMenu();
+}
+
+// -------------------------------------------------------
+// OPCJA 8: PASYWNY MONITOR RUCHU BLE
 // -------------------------------------------------------
 void uruchomMonitorRuchuBLE() {
   tft.fillScreen(ST77XX_BLACK);
@@ -697,7 +861,8 @@ void loop() {
       case 3: uruchomKlonerNFC();      break;
       case 4: uruchomBruceBLEScanner(); break;
       case 5: uruchomBruceWardriving(); break;
-      case 6: uruchomMonitorRuchuBLE(); break;
+      case 6: uruchomTrackerBLE();      break; // NOWOŚĆ
+      case 7: uruchomMonitorRuchuBLE(); break;
     }
   }
 
